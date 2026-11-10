@@ -1,17 +1,31 @@
 # Design notes
 
-I picked questions 1 and 2. They follow directly from the Part 1 bug, where
+> **Rough first draft.** Questions 1 and 2 are the positions I'd defend.
+> Question 3 is notes, not a finished answer. Each section ends with the
+> open questions to discuss.
+
+Questions 1 and 2 follow directly from the Part 1 bug, where
 `record_decision` was a multi-step write with nothing holding the steps
 together.
 
 ## 1. Where does downstream orchestration belong?
 
-**Position: the system of record owns it, not the agent loop and not the
-policy.** The agent's job ends when a decision is durably recorded. Freezing
-the account, notifying the customer, filing the report and routing to a queue
-are all *consequences of a decision*, not part of making one. They run in a
-backend workflow that is triggered by the decision row. The model doesn't run
-them.
+**Position: the API service owns it, split into two pieces. It's not in the
+agent loop and not in the policy.**
+- **The API's transaction** guarantees that every decision produces an
+  event. `POST /decisions` already commits the decision, the case close and
+  the audit entry together. It also writes a `decision.recorded` event in
+  that same commit.
+- **A worker deployed alongside the API** carries out the steps: freeze,
+  notify, file, route to a queue. It reads the same database and knows
+  nothing about models, prompts or MCP.
+
+The agent's job ends when a decision is durably recorded. Freezing the
+account, notifying the customer, filing the report and routing to a queue are
+all *consequences of a decision*, not part of making one. To the worker, the
+agent is just one writer of decisions, alongside the analyst console and
+batch jobs. The steps don't run inside the request handler either (see
+below).
 
 **What breaks if it lives in the policy (the model sequences it):**
 - Nothing guarantees it happens. The model can skip a step, reorder steps, or
@@ -70,6 +84,17 @@ them.
 - Every step writes to `audit_log`, so the ledger records what *happened*,
   not just what was decided.
 
+**Open questions:**
+- What happens when an analyst overturns an agent `block` after the freeze?
+  The workflow needs a compensation path (unfreeze, retract the notice). Who
+  owns that?
+- Does `needs_review` count as "decided"? Right now it closes the case, so
+  the 409 rule would stop the analyst from recording the real outcome. It
+  probably needs its own status, or decisions need to allow supersession by
+  a human.
+- Is an outbox worker enough, or does the regulatory deadline justify a real
+  workflow engine on day one?
+
 ## 2. Where is the line between code and prompt?
 
 **My rule:** if a rule can be checked deterministically from data the system
@@ -114,3 +139,67 @@ waste turns finding it out. But the prompt is never the enforcement.
   data rather than asserted. It belongs in the prompt (it's judgment), but it
   should be measured by evals that include accounts whose history is
   misleading.
+
+**Open questions:**
+- Where does the citation check live: in the API (which then has to
+  understand rationale text) or as a structured `evidence: [ids]` field on
+  `DecisionIn`? Leaning toward the structured field, with the prose
+  rationale kept for humans.
+- Should "required reads were made" be enforced, or only measured? Enforcing
+  it couples the API to the agent's tool sequence, which an analyst console
+  wouldn't follow.
+
+## 3. What would you have to build to trust this in production? *(rough notes)*
+
+**What grading only the final decision misses:**
+- **Right answer, wrong reasons.** The agent can match `expect_decision`
+  while skipping required steps (e.g. never fetching prior cases). The grade
+  passes and the process is broken. It will fail on the next case where
+  that step mattered.
+- **Unfaithful rationales.** `must_cite` checks that an id *appears* in the
+  text, not that the claim about it is true, or that the agent actually
+  retrieved it.
+- **Variance.** Each scenario runs once. A 70%-reliable behaviour passes
+  most days.
+- **Gaming via `needs_review`.** An agent that sends everything to humans
+  is never wrong about a block, and it quietly floods the review queue.
+  Accuracy per scenario doesn't show this; the decision mix does.
+- **Coverage.** Six hand-written scenarios. There are none for prompt
+  injection in transaction descriptions, tool failures partway through, or
+  the degraded shard.
+- **Real outcomes.** Expected values are what we *think* is right. In
+  production, the truth arrives later: chargebacks on approves, reversed
+  blocks.
+
+**What I'd add (offline):**
+- Trace-level graders that need no model: required tools called before
+  `record_decision`, every cited id actually returned by a tool in this
+  trace, no errors swallowed.
+- Repeat each scenario N times and report pass *rate*, not pass/fail.
+- An LLM judge for rationale faithfulness, calibrated against a small
+  human-labelled set before anyone trusts its scores.
+- Adversarial and failure scenarios: injected instructions in
+  descriptions, a 5xx from each tool, empty history, conflicting signals.
+
+**What I'd add (production, 10k/day, no transcript reading):**
+- **Shadow mode first.** Agent decides, analysts decide independently, and
+  we measure agreement per decision type before the agent's decisions take
+  effect.
+- **Stamp every decision** with model version, policy version, and trace id,
+  so a regression can be traced to a change.
+- **Decision-mix monitoring.** Block/approve/needs_review rates per flag
+  reason and segment, with drift alerts. A sudden jump in `approve` on
+  `mrc_giftmax` is the signal, not any single transcript.
+- **Outcome feedback loop.** Join decisions to chargebacks and analyst
+  reversals; that gives real false-negative and false-positive rates, and
+  new eval cases come from the misses.
+- **Stratified human audit.** Sample a fixed number per day, weighted
+  toward blocks and toward cases where the agent's evidence was thin.
+- **Keep the nightly ledger reconciliation** (the Part 1 test) running in
+  production, alongside cost, latency, and context-size budgets per case.
+
+**Open questions:**
+- What agreement rate in shadow mode is good enough to go live, and is it
+  the same bar for `approve` as for `block`?
+- How long is the feedback lag on chargebacks, and what do we watch in the
+  meantime?
