@@ -75,6 +75,8 @@ async def record_decision(case_id: str, decision: str, rationale: str) -> str:
                 if r.status_code < 400:
                     return json.dumps(r.json(), indent=2)
                 last_error = f"HTTP {r.status_code}: {r.text}"
+                if r.status_code < 500:
+                    break  # 4xx won't change on retry; hand it back to the model
             except httpx.HTTPError as exc:
                 last_error = str(exc)
     return json.dumps({"error": last_error}, indent=2)

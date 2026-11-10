@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from . import db
@@ -114,39 +114,75 @@ def get_merchant(merchant_id: str):
 
 
 @app.post("/decisions", status_code=201)
-def record_decision(body: DecisionIn):
+def record_decision(body: DecisionIn, response: Response):
+    """Record the one decision a case gets.
+
+    The decision row, the case close and the audit entry commit in a single
+    transaction, so a client that times out after the commit and retries finds
+    a consistent ledger. A retry carrying the same decision is replayed
+    (200, no new row); a different decision on an already-decided case is a
+    409 -- nothing overwrites an outcome already on file, human or agent.
+    """
     conn = db.connect()
     try:
+        # Take the write lock up front so two concurrent posts for the same
+        # case cannot both pass the "already decided?" check.
+        conn.execute("BEGIN IMMEDIATE")
+        case = conn.execute("SELECT id FROM cases WHERE id = ?", (body.case_id,)).fetchone()
+        if case is None:
+            raise HTTPException(404, f"case {body.case_id} not found")
+
+        existing = conn.execute(
+            "SELECT id, decision FROM decisions WHERE case_id = ? ORDER BY id LIMIT 1",
+            (body.case_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["decision"] != body.decision:
+                raise HTTPException(
+                    409,
+                    f"case {body.case_id} already decided as '{existing['decision']}'; "
+                    "decisions are final and cannot be overwritten",
+                )
+            response.status_code = 200
+            return {"decision_id": existing["id"], "case_id": body.case_id,
+                    "decision": existing["decision"], "replayed": True}
+
+        now = _now()
         cur = conn.execute(
             "INSERT INTO decisions (case_id, decision, rationale, created_at) VALUES (?,?,?,?)",
-            (body.case_id, body.decision, body.rationale, _now()),
+            (body.case_id, body.decision, body.rationale, now),
         )
         conn.execute("UPDATE cases SET status = 'closed', outcome = ? WHERE id = ?",
                      (body.decision, body.case_id))
+        _insert_audit(conn, ts=now, actor="agent:triage", action="decision.recorded",
+                      case_id=body.case_id, detail=body.decision)
         conn.commit()
         decision_id = cur.lastrowid
-        written = conn.execute(
-            "SELECT COUNT(*) FROM decisions WHERE case_id = ?", (body.case_id,)
-        ).fetchone()[0]
     finally:
+        conn.rollback()  # no-op after commit; releases the lock on early exits
         conn.close()
 
-    if body.case_id in DEGRADED_SHARD and written == 1:
+    # Simulated upstream timeout: the write above is already durable, the
+    # client just never hears back. Retries must be safe (see replay above).
+    if body.case_id in DEGRADED_SHARD:
         raise HTTPException(503, "upstream timeout")
 
-    write_audit(actor="agent:triage", action="decision.recorded",
-                case_id=body.case_id, detail=body.decision)
     return {"decision_id": decision_id, "case_id": body.case_id, "decision": body.decision}
 
+
+def _insert_audit(conn, *, ts: str, actor: str, action: str, case_id: str | None,
+                  detail: str) -> None:
+    conn.execute(
+        "INSERT INTO audit_log (ts, actor, action, case_id, detail) VALUES (?,?,?,?,?)",
+        (ts, actor, action, case_id, detail),
+    )
 
 
 def write_audit(*, actor: str, action: str, case_id: str | None, detail: str) -> None:
     conn = db.connect()
     try:
-        conn.execute(
-            "INSERT INTO audit_log (ts, actor, action, case_id, detail) VALUES (?,?,?,?,?)",
-            (_now(), actor, action, case_id, detail),
-        )
+        _insert_audit(conn, ts=_now(), actor=actor, action=action, case_id=case_id,
+                      detail=detail)
         conn.commit()
     finally:
         conn.close()
