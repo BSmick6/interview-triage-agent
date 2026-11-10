@@ -106,6 +106,36 @@ rule is broken, it can't depend on a model choosing to comply.
 The prompt can still *mention* a code-enforced rule so the model doesn't
 waste turns finding it out. But the prompt is never the enforcement.
 
+**"Prompt" means everything the model reads, not just `policy.md`.** In
+this repo that's four channels:
+
+| Channel | Where | What belongs there |
+|---|---|---|
+| System prompt | `triage/policy.md` | Rules for the whole investigation: evidence standard, required steps, what counts as conflicting |
+| Tool descriptions | docstrings in `triage/mcp_server.py` | Rules about one action, read right before the model takes it |
+| Tool schemas | MCP tool signatures | Constraints that are both shown to the model *and* checked in code |
+| Error text | `HTTPException` messages from the API | What went wrong and what to do next, after code rejects a call |
+
+Two refinements to the rule follow from that:
+- **Prefer the schema to prose.** If a code-enforced constraint can be
+  expressed as a type, express it once and generate both the model-facing
+  schema and the API validation from it. `decision` is the example:
+  today it's a `str` in both `record_decision` and `DecisionIn`, and the
+  allowed values exist only in the docstring and the policy. As a
+  `Literal["approve", "block", "needs_review"]` it becomes an enum the model
+  sees and a 422 the API enforces, with nothing to keep in sync by hand.
+- **Error messages are where code explains itself to the model.** Code
+  enforces the rule, but the rejection text is the model's only guidance on
+  how to recover. "409: already decided as 'block'; decisions are final"
+  tells it to stop. A bare 500 tells it nothing, and the policy tells it to
+  retry. So every code-side rule needs an error message written for the
+  model as its reader.
+
+The `record_decision` docstring shows what goes wrong without this: it
+restates "call this exactly once" and the allowed values by hand, so the
+same rules now live in the policy, the docstring, and (for "exactly once")
+the API. Each copy can drift from the others.
+
 **Applied to the two examples:**
 - **"Never decide a case a human already closed"** → **code.** It's a
   predicate on the case and decision rows, and breaking it overwrites a
