@@ -155,9 +155,6 @@ the API. Each copy can drift from the others.
     rejected or downgraded.
 
 **Other places this repo puts things on the wrong side:**
-- `decision` is a free `str` in `DecisionIn`. The allowed values are written
-  only in the tool docstring and the policy. They should be a
-  `Literal[...]` / enum in code.
 - "Call `record_decision` exactly once" is policy prose. The idempotency and
   409 behaviour added in Part 1 now enforce it in code, so the prose is just
   a hint.
